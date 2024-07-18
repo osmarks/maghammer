@@ -1,0 +1,45 @@
+[package]
+name = "idiosyncratic-scimitar"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
+tokio = { version = "1", features = ["full"]}
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+async-walkdir = "2"
+lazy_static = "1"
+compact_str = { version = "0.8.0-beta", features = ["serde"] }
+seahash = "4"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+reqwest = "0.12"
+deadpool-postgres = "0.14"
+log = "0.4"
+pretty_env_logger = "0.5"
+pgvector = { version = "0.3", features = ["postgres", "halfvec"] }
+tokenizers = { version = "0.19", features = ["http"] }
+regex = "1"
+futures = "0.3"
+html5gum = "0.5"
+async-trait = "0.1"
+num_cpus = "1"
+epub = "2"
+tokio-stream = { version = "0.1", features = ["fs"] }
+rusqlite = "0.31"
+serde_json = "1"
+rmp-serde = "1"
+serde_bytes = "0.11"
+half = "2"
+ntex = { version = "2", features = ["tokio"] }
+maud = "0.26"
+percent-encoding = "2"
+rs-abbreviation-number = "0.3"
+ntex-files = "2"
+derive_more = "0.99"
+im = { version = "15", features = ["serde"] }
+sea-query = { version = "0.30", features = ["backend-postgres", "postgres-array"] }
+sea-query-postgres = { version = "0.4", features = ["postgres-array"] }
+ulid = { version = "1", features = ["serde"] }
+mail-parser = "0.9"

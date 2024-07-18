@@ -1,0 +1,10 @@
+pub mod textfiles;
+pub mod books;
+pub mod mediafiles;
+pub mod anki;
+pub mod minoteaur;
+pub mod thunderbird_email;
+pub mod miniflux;
+pub mod atuin;
+pub mod rclwe;
+pub mod firefox_history_dump;

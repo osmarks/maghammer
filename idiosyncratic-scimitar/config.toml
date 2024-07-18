@@ -1,0 +1,57 @@
+database = "host=localhost port=5432 user=maghammer dbname=maghammer"
+concurrency = 8
+
+[semantic]
+backend = "http://100.64.0.10:1706"
+embedding_dim = 1024
+tokenizer = "Snowflake/snowflake-arctic-embed-l"
+max_tokens = 510
+batch_size = 256
+
+[indexers.text_files]
+path = "/data/archive"
+base_url = "https://media.osmarks.net/Archive/"
+
+[indexers.books]
+path = "/data/calibre"
+
+[indexers.media_files]
+path = "./mediatest"
+ignore_regexes = [
+    "virgo inbound/.*",
+    "Large Thing Backups/.*",
+    "Sam's Laser FAQ/.*",
+    "Video Docs/.*",
+    "Thumbnails/.*"
+]
+ignore_metadata_regexes = [
+    "GalaxyTV",
+    "x26[45]"
+]
+base_url = "https://media.osmarks.net/"
+
+[indexers.anki]
+db_path = "/data/anki/collections/osmarks/collection.anki2"
+
+[indexers.minoteaur]
+db_path = "/data/minoteaur/minoteaur.sqlite3"
+base_url = "https://notes.osmarks.net/"
+
+[indexers.email]
+account_mapping = { "imap.purelymail.com" = "personal", "outlook.office365.com" = "university" }
+mboxes_path = "/home/osmarks/.thunderbird/3nacdt54.default-release/ImapMail/"
+ignore_mboxes = ["Junk", "nstmp"]
+
+[indexers.miniflux]
+source_database = "host=localhost dbname=miniflux user=miniflux"
+
+[indexers.atuin]
+db_path = "/home/osmarks/.local/share/atuin/history.db"
+
+[indexers.rclwe]
+input = "rclwe_dump"
+output = "rclwe_dump2"
+
+[indexers.browser_history]
+db_path = "/data/archive/lthist.sqlite3"
+include_untimestamped_records = false
