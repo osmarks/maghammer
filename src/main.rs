@@ -1,13 +1,12 @@
 use chrono::{DateTime, Utc};
 use compact_str::{CompactString, ToCompactString};
 use deadpool_postgres::{Manager, ManagerConfig, RecyclingMethod, Pool};
-use futures::{StreamExt, TryFutureExt};
 use indexer::{ColumnSpec, TableSpec};
 use pgvector::HalfVector;
 use semantic::SemanticCtx;
-use tokio::signal::unix::{signal, SignalKind};
 use tokio_postgres::{NoTls, Row};
 use anyhow::{Context, Result};
+use tracing::Instrument;
 use util::{get_column_string, urlencode};
 use std::collections::{BTreeMap, HashMap};
 use std::{str::FromStr, sync::Arc, fmt::Write};
@@ -16,6 +15,7 @@ use maud::{html, Markup, Render, DOCTYPE};
 use serde::{Deserialize, Serialize};
 use rs_abbreviation_number::NumericAbbreviate;
 use sea_query_postgres::PostgresBinder;
+use tracing_subscriber::prelude::*;
 
 mod indexer;
 mod indexers;
@@ -40,7 +40,7 @@ CREATE FUNCTION {name}_track() RETURNS trigger AS $$
     BEGIN
         IF NEW IS DISTINCT FROM OLD THEN
             INSERT INTO {name}_change_tracker VALUES (
-                new.id, 
+                new.id,
                 CURRENT_TIMESTAMP
             )
             ON CONFLICT (id) DO UPDATE SET timestamp = CURRENT_TIMESTAMP;
@@ -671,7 +671,7 @@ async fn fts_page(state: web::types::State<ServerState>, query: web::types::Quer
     let prefixed = Arc::new(prefixed);
     let unprefixed = Arc::new(unprefixed);
     let mut results = HashMap::new();
-    
+
     let mut set = tokio::task::JoinSet::new();
     for ix in state.indexers.iter() {
         for table in ix.tables() {
@@ -771,7 +771,9 @@ impl ServerState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    pretty_env_logger::init();
+    console_subscriber::ConsoleLayer::builder()
+        .with_default_env()
+        .init();
 
     let pg_config = tokio_postgres::Config::from_str(&CONFIG.database)?;
     let mgr_config = ManagerConfig { recycling_method: RecyclingMethod::Fast };
@@ -779,12 +781,12 @@ async fn main() -> Result<()> {
     let pool = Pool::builder(mgr).max_size(20).build()?;
 
     let indexers: Arc<Vec<Box<dyn Indexer>>> = Arc::new(vec![
+        indexers::mediafiles::MediaFilesIndexer::new(CONFIG.indexers["media_files"].clone()).await?,
         indexers::firefox_history_dump::FirefoxHistoryDumpIndexer::new(CONFIG.indexers["browser_history"].clone()).await?,
         indexers::rclwe::RclweIndexer::new(CONFIG.indexers["rclwe"].clone()).await?,
         indexers::atuin::AtuinIndexer::new(CONFIG.indexers["atuin"].clone()).await?,
         indexers::miniflux::MinifluxIndexer::new(CONFIG.indexers["miniflux"].clone()).await?,
         indexers::thunderbird_email::EmailIndexer::new(CONFIG.indexers["email"].clone()).await?,
-        indexers::mediafiles::MediaFilesIndexer::new(CONFIG.indexers["media_files"].clone()).await?,
         indexers::books::BooksIndexer::new(CONFIG.indexers["books"].clone()).await?,
         indexers::textfiles::TextFilesIndexer::new(CONFIG.indexers["text_files"].clone()).await?,
         indexers::anki::AnkiIndexer::new(CONFIG.indexers["anki"].clone()).await?,
@@ -805,7 +807,7 @@ async fn main() -> Result<()> {
             for (index, sql) in indexer.schemas().iter().enumerate() {
                 let index = index as i32;
                 if index >= version {
-                    log::info!("Migrating {} to {}.", name, index);
+                    tracing::info!("Migrating {} to {}.", name, index);
                     let tx = conn.transaction().await?;
                     tx.batch_execute(*sql).await.context("execute migration")?;
                     tx.execute("INSERT INTO versions VALUES ($1, $2) ON CONFLICT (indexer) DO UPDATE SET version = $2", &[&name, &(index + 1)]).await.context("update migrations database")?;
@@ -825,11 +827,10 @@ async fn main() -> Result<()> {
                 let ctx = Arc::new(indexer::Ctx {
                     pool: pool.clone()
                 });
-                log::info!("Indexing: {}.", indexer.name());
-                indexer.run(ctx).await.context(indexer.name())?;
-                log::info!("Building FTS index: {}.", indexer.name());
+                tracing::info!("indexing {}", indexer.name());
+                indexer.run(ctx).instrument(tracing::info_span!("index", indexer = indexer.name())).await.context(indexer.name())?;
+                tracing::info!("FTS indexing {}", indexer.name());
                 semantic::fts_for_indexer(indexer, sctx.clone()).await?;
-                log::info!("Done: {}.", indexer.name())
             }
             Ok(())
         },
@@ -856,7 +857,46 @@ async fn main() -> Result<()> {
                     Ok(())
                 }).context("init fail")
             })
-        }
+        },
+        "sql" => {
+            println!("delete semantic indices:");
+            for indexer in indexers.iter() {
+                for table in indexer.tables() {
+                    for column in table.columns {
+                        if column.fts {
+                            println!("DELETE FROM {}_{}_fts_chunks;", table.name, column.name);
+                            println!("DROP INDEX IF EXISTS {}_{}_fts_chunks_embedding_idx;", table.name, column.name);
+                        }
+                    }
+
+                    println!("DELETE FROM {}_change_tracker;", table.name);
+                    println!("INSERT INTO {}_change_tracker SELECT id, CURRENT_TIMESTAMP FROM {};", table.name, table.name);
+                }
+            }
+
+            println!("create semantic indices:");
+            for indexer in indexers.iter() {
+                for table in indexer.tables() {
+                    for column in table.columns {
+                        if column.fts {
+                            println!("CREATE INDEX {}_{}_fts_chunks_embedding_idx ON {}_{}_fts_chunks USING hnsw (embedding halfvec_ip_ops);", table.name, column.name, table.name, column.name);
+                        }
+                    }
+                }
+            }
+
+            println!("create document index:");
+            for indexer in indexers.iter() {
+                for table in indexer.tables() {
+                    for column in table.columns {
+                        if column.fts {
+                            println!("CREATE INDEX {}_{}_fts_chunks_document_idx ON {}_{}_fts_chunks (document);", table.name, column.name, table.name, column.name);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        },
         _ => Ok(())
     }
 }

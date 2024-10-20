@@ -2,9 +2,11 @@ use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 use anyhow::{Context, Result};
 use futures::pin_mut;
 use serde::{Deserialize, Serialize};
-use crate::{indexer::{ColumnSpec, Ctx, Indexer, TableSpec}, util::{hash_str, parse_html, systemtime_to_utc}};
+use crate::{indexer::{ColumnSpec, Ctx, Indexer, TableSpec}, util::{parse_html, systemtime_to_utc}};
 use chrono::prelude::*;
 use tokio_postgres::{binary_copy::BinaryCopyInWriter, types::Type};
+use tracing::instrument;
+use std::pin::Pin;
 
 #[derive(Serialize, Deserialize)]
 struct Config {
@@ -82,7 +84,7 @@ CREATE TABLE webpages (
     }
 
     async fn run(&self, ctx: Arc<Ctx>) -> Result<()> {
-        let conn = ctx.pool.get().await?;        
+        let conn = ctx.pool.get().await?;
         let sink = conn.copy_in("COPY webpages (timestamp, url, title, content, html) FROM STDIN BINARY").await?;
 
         let input = PathBuf::from(&self.config.input);
@@ -94,50 +96,7 @@ CREATE TABLE webpages (
         pin_mut!(writer);
 
         while let Some(entry) = readdir.next_entry().await? {
-            if entry.file_type().await?.is_file() {
-                let path = entry.path();
-                let name = path.file_name().unwrap().to_str().context("invalid path")?;
-                // for some reason there are several filename formats in storage
-                let mut metadata = None;
-                if name.starts_with("firefox-recoll-web") {
-                    let meta_file = "_".to_owned() + name;
-                    let mtime = systemtime_to_utc(entry.metadata().await?.modified()?)?;
-                    if let Some(url) = tokio::fs::read_to_string(input.join(&meta_file)).await?.lines().next() {
-                        metadata = Some((mtime, url.to_string()));
-                        tokio::fs::rename(input.join(&meta_file), output.join(&meta_file)).await?;
-                    } else {
-                        log::warn!("Metadata error for {}", name);
-                    }                    
-                }
-                if let Some(rem) = name.strip_suffix(".html") {
-                    let meta_file = format!("{}.dic", rem);
-                    let meta = parse_circache_meta(&tokio::fs::read_to_string(input.join(&meta_file)).await?).context("invalid metadata format")?;
-                    let mtime = i64::from_str(meta.get("fmtime").context("invalid metadata format")?)?;
-                    metadata = Some((DateTime::from_timestamp(mtime, 0).context("time is broken")?, meta.get("url").context("invalid metadata format")?.to_string()));
-                    move_file(&input.join(&meta_file), output.join(&meta_file)).await?;
-                }
-                if let Some(rem) = name.strip_prefix("recoll-we-c") {
-                    let meta_file = format!("recoll-we-m{}", rem);
-                    let mtime = systemtime_to_utc(entry.metadata().await?.modified()?)?;
-                    if tokio::fs::try_exists(input.join(&meta_file)).await? {
-                        if let Some(url) = tokio::fs::read_to_string(input.join(&meta_file)).await?.lines().next() {
-                            metadata = Some((mtime, url.to_string()));
-                            move_file(&input.join(&meta_file), output.join(&meta_file)).await?;
-                        } else {
-                            log::warn!("Metadata error for {}", name);
-                        }
-                    } else {
-                        log::warn!("No metadata for {}", name);
-                    }
-                }
-
-                if let Some((mtime, url)) = metadata {
-                    let html = tokio::fs::read(&path).await?;
-                    move_file(&path, output.join(name)).await?;
-                    let (content, title) = parse_html(html.as_slice(), true);
-                    writer.as_mut().write(&[&mtime, &url, &title.replace("\0", ""), &content.replace("\0", ""), &String::from_utf8_lossy(&html).replace("\0", "")]).await?;
-                }
-            }
+            RclweIndexer::process_entry(entry, &input, &output, &mut writer).await?;
         }
 
         writer.finish().await?;
@@ -156,5 +115,58 @@ impl RclweIndexer {
         Ok(Box::new(RclweIndexer {
             config: Arc::new(config)
         }))
+    }
+
+    #[instrument(skip(writer))]
+    async fn process_entry(entry: tokio::fs::DirEntry, input: &PathBuf, output: &PathBuf, writer: &mut Pin<&mut BinaryCopyInWriter>) -> Result<()> {
+        if entry.file_type().await?.is_file() {
+            let path = entry.path();
+            let name = path.file_name().unwrap().to_str().context("invalid path")?;
+            // for some reason there are several filename formats in storage
+            let mut metadata = None;
+            if name.starts_with("firefox-recoll-web") {
+                tracing::trace!("reading firefox-recoll-web");
+                let meta_file = "_".to_owned() + name;
+                let mtime = systemtime_to_utc(entry.metadata().await?.modified()?)?;
+                if let Some(url) = tokio::fs::read_to_string(input.join(&meta_file)).await?.lines().next() {
+                    metadata = Some((mtime, url.to_string()));
+                    tokio::fs::rename(input.join(&meta_file), output.join(&meta_file)).await?;
+                } else {
+                    tracing::warn!("Metadata error for {}", name);
+                }
+            }
+            if let Some(rem) = name.strip_suffix(".html") {
+                tracing::trace!("reading circache html");
+                let meta_file = format!("{}.dic", rem);
+                let meta = parse_circache_meta(&tokio::fs::read_to_string(input.join(&meta_file)).await?).context("invalid metadata format")?;
+                let mtime = i64::from_str(meta.get("fmtime").context("invalid metadata format")?)?;
+                metadata = Some((DateTime::from_timestamp(mtime, 0).context("time is broken")?, meta.get("url").context("invalid metadata format")?.to_string()));
+                move_file(&input.join(&meta_file), output.join(&meta_file)).await?;
+            }
+            if let Some(rem) = name.strip_prefix("recoll-we-c") {
+                tracing::trace!("reading recoll-we-c");
+                let meta_file = format!("recoll-we-m{}", rem);
+                let mtime = systemtime_to_utc(entry.metadata().await?.modified()?)?;
+                if tokio::fs::try_exists(input.join(&meta_file)).await? {
+                    if let Some(url) = tokio::fs::read_to_string(input.join(&meta_file)).await?.lines().next() {
+                        metadata = Some((mtime, url.to_string()));
+                        move_file(&input.join(&meta_file), output.join(&meta_file)).await?;
+                    } else {
+                        tracing::warn!("Metadata error for {}", name);
+                    }
+                } else {
+                    tracing::warn!("No metadata for {}", name);
+                }
+            }
+
+            if let Some((mtime, url)) = metadata {
+                let html = tokio::fs::read(&path).await?;
+                move_file(&path, output.join(name)).await?;
+                let (content, title) = parse_html(html.as_slice(), true);
+                writer.as_mut().write(&[&mtime, &url, &title.replace("\0", ""), &content.replace("\0", ""), &String::from_utf8_lossy(&html).replace("\0", "")]).await?;
+            }
+        }
+
+        Ok(())
     }
 }

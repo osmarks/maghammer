@@ -12,6 +12,8 @@ use chrono::prelude::*;
 use tokio::{fs::File, io::{AsyncBufReadExt, BufReader}};
 use mail_parser::MessageParser;
 use std::future::Future;
+use compact_str::CompactString;
+use tracing::instrument;
 
 #[derive(Serialize, Deserialize)]
 struct Config {
@@ -47,6 +49,7 @@ lazy_static::lazy_static! {
     static ref MULTIPART_REGEX: regex::bytes::Regex = regex::bytes::RegexBuilder::new(r#"content-type:\s*multipart/(mixed|alternative);\s*boundary="?([A-Za-z0-9=_-]+)"?;?\r\n$"#).case_insensitive(true).build().unwrap();
 }
 
+#[instrument(skip(callback))]
 async fn read_mbox<U: Future<Output=Result<()>>, F: FnMut(Email) -> U>(path: &PathBuf, mut callback: F) -> Result<()> {
     let input = File::open(path).await?;
     let mut buf = Vec::new();
@@ -99,7 +102,7 @@ async fn read_mbox<U: Future<Output=Result<()>>, F: FnMut(Email) -> U>(path: &Pa
                 current_delim = None;
             }
         }
-        
+
         if current_delim.is_none() && line.starts_with(b"From ") && !buf.is_empty() {
             if let Ok(Some(mail)) = parse_current(&mut buf) {
                 callback(mail).await?;
@@ -153,7 +156,7 @@ CREATE TABLE IF NOT EXISTS emails (
                     ColumnSpec {
                         name: "subject",
                         fts: true,
-                        fts_short: false,
+                        fts_short: true,
                         trigram: true,
                         is_array: false
                     },
@@ -179,42 +182,14 @@ CREATE TABLE IF NOT EXISTS emails (
         while let Some(entry) = entries.try_next().await? {
             let path = entry.path();
             let mbox = path.file_stem().and_then(|x| x.to_str()).context("invalid path")?.to_compact_string();
-            let folder = path.parent().unwrap().file_name().unwrap().to_str().unwrap();
-            if let Some(account) = config.account_mapping.get(folder) {
+            let folder = path.parent().unwrap().file_name().unwrap().to_str().unwrap().to_compact_string();
+            if let Some(account) = config.account_mapping.get(&*folder) {
                 let account = account.to_compact_string();
                 let ext = path.extension();
                 if let None = ext {
                     if !self.config.ignore_mboxes.contains(mbox.as_str()) {
                         let ctx = ctx.clone();
-                        js.spawn(async move {
-                            read_mbox(&path, move |mail| {
-                                let ctx = ctx.clone();
-                                let mbox = mbox.trim_end_matches("-1").to_compact_string();
-                                let account = account.clone();
-                                async move {
-                                    let conn = ctx.pool.get().await?;
-                                    let id = hash_thing(&mail.raw.as_slice());
-                                    let body = match mail.body {
-                                        Body::Plain(t) => t,
-                                        Body::Html(h) => parse_html(h.as_bytes(), false).0
-                                    };
-                                    conn.execute(r#"INSERT INTO emails VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO UPDATE SET box = $7"#, &[
-                                        &id,
-                                        &mail.message_id,
-                                        &mail.reply_to,
-                                        &mail.date,
-                                        &mail.raw,
-                                        &account.as_str(),
-                                        &mbox.as_str(),
-                                        &mail.from,
-                                        &mail.from_address,
-                                        &mail.subject,
-                                        &body
-                                    ]).await?;
-                                    Ok(())
-                                }
-                            }).await
-                        });
+                        js.spawn(EmailIndexer::process_mbox(ctx.clone(), path.clone(), mbox, folder, account.clone()));
                     }
                 }
             }
@@ -238,5 +213,37 @@ impl EmailIndexer {
         Ok(Box::new(EmailIndexer {
             config: Arc::new(config)
         }))
+    }
+
+    #[instrument(skip(ctx))]
+    async fn process_mbox(ctx: Arc<Ctx>, path: PathBuf, mbox: CompactString, folder: CompactString, account: CompactString) -> Result<()> {
+        tracing::trace!("reading mailbox");
+        read_mbox(&path, move |mail| {
+            let ctx = ctx.clone();
+            let account = account.clone();
+            let mbox = mbox.trim_end_matches("-1").to_compact_string();
+            async move {
+                let conn = ctx.pool.get().await?;
+                let id = hash_thing(&mail.raw.as_slice());
+                let body = match mail.body {
+                    Body::Plain(t) => t,
+                    Body::Html(h) => parse_html(h.as_bytes(), false).0
+                };
+                conn.execute(r#"INSERT INTO emails VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO UPDATE SET box = $7"#, &[
+                    &id,
+                    &mail.message_id,
+                    &mail.reply_to,
+                    &mail.date,
+                    &mail.raw,
+                    &account.as_str(),
+                    &mbox.as_str(),
+                    &mail.from,
+                    &mail.from_address,
+                    &mail.subject,
+                    &body
+                ]).await?;
+                Ok(())
+            }
+        }).await
     }
 }

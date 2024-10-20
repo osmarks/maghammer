@@ -13,6 +13,7 @@ use crate::util::{hash_str, parse_html, parse_date, systemtime_to_utc, CONFIG};
 use crate::indexer::{delete_nonexistent_files, Ctx, Indexer, TableSpec, ColumnSpec};
 use chrono::prelude::*;
 use std::str::FromStr;
+use tracing::instrument;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Config {
@@ -35,6 +36,7 @@ pub struct EpubParse {
     tags: Vec<String>
 }
 
+#[instrument]
 pub fn parse_epub(path: &PathBuf) -> Result<EpubParse> {
     let mut epub = EpubDoc::new(path).context("initial doc load")?;
 
@@ -58,6 +60,8 @@ pub fn parse_epub(path: &PathBuf) -> Result<EpubParse> {
         tags: epub.metadata.get("subject").cloned().unwrap_or_else(Vec::new)
     };
 
+    tracing::trace!("read epub {:?}", path);
+
     let mut seen = HashSet::new();
     for navpoint in epub.toc.clone() {
         let path = navpoint.content;
@@ -71,16 +75,18 @@ pub fn parse_epub(path: &PathBuf) -> Result<EpubParse> {
             seen.insert(last.to_string());
             let resource = epub.get_resource_str_by_path(last).with_context(|| format!("resource {} nonexistent", last))?;
             let html = parse_html(resource.as_bytes(), true);
+            tracing::trace!("read epub chapter {:?}", navpoint.label);
             parse.chapters.push((
                 html.0,
                 navpoint.label.clone()
-            ))
+            ));
         }
     }
 
     Ok(parse)
 }
 
+#[instrument(skip(ctx, existing_files))]
 async fn handle_epub(relpath: CompactString, ctx: Arc<Ctx>, entry: DirEntry, existing_files: Arc<RwLock<HashSet<CompactString>>>) -> Result<()> {
     let epub = entry.path();
 
@@ -95,7 +101,7 @@ async fn handle_epub(relpath: CompactString, ctx: Arc<Ctx>, entry: DirEntry, exi
         let parse_result = match tokio::task::spawn_blocking(move || parse_epub(&epub)).await? {
             Ok(x) => x,
             Err(e) => {
-                log::warn!("Failed parse for {}: {}", relpath, e);
+                tracing::warn!("Failed parse for {}: {}", relpath, e);
                 return Ok(())
             }
         };
@@ -229,7 +235,7 @@ CREATE TABLE chapters (
         let entries = WalkDir::new(&self.config.path);
         let base_path = &self.config.path;
 
-        entries.map_err(|e| anyhow::Error::from(e)).try_for_each_concurrent(Some(CONFIG.concurrency), |entry| 
+        entries.map_err(|e| anyhow::Error::from(e)).try_for_each_concurrent(Some(CONFIG.concurrency), |entry|
         {
             let ctx = ctx.clone();
             let existing_files = existing_files.clone();

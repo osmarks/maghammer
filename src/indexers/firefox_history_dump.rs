@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use crate::{indexer::{ColumnSpec, Ctx, Indexer, TableSpec}, util::hash_str};
 use chrono::prelude::*;
 use tokio_postgres::{binary_copy::BinaryCopyInWriter, types::Type};
-use rusqlite::OpenFlags;
+use rusqlite::{types::ValueRef, OpenFlags};
 use tokio::sync::mpsc::Sender;
+use tracing::instrument;
 
 #[derive(Serialize, Deserialize)]
 struct Config {
@@ -63,14 +64,14 @@ CREATE TABLE history (
                     ColumnSpec {
                         name: "title",
                         fts: true,
-                        fts_short: false,
+                        fts_short: true,
                         trigram: true,
                         is_array: false
                     },
                     ColumnSpec {
                         name: "description",
                         fts: true,
-                        fts_short: false,
+                        fts_short: true,
                         trigram: false,
                         is_array: false
                     }
@@ -162,12 +163,19 @@ impl FirefoxHistoryDumpIndexer {
         }))
     }
 
+    #[instrument(skip(places, bookmarks, history, self))]
     fn read_database(&self, places: Sender<(String, String, Option<String>, i64, Option<i64>, Option<String>, Option<String>)>, places_min_ts: i64, bookmarks: Sender<(String, String, String, i64, i64)>, bookmarks_min_ts: i64, history: Sender<(String, String, i64, i32)>, history_min_ts: i64) -> Result<()> {
         let conn = rusqlite::Connection::open_with_flags(&self.config.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         // Apparently some records in my history database have no last_visit_date. I don't know what happened to it or why, but this is not fixable, so add an ugly hack for them.
         let mut fetch_places = conn.prepare(if self.config.include_untimestamped_records { "SELECT guid, url, title, visit_count, last_visit_date, description, preview_image_url FROM places WHERE last_visit_date > ? OR last_visit_date IS NULL ORDER BY last_visit_date ASC" } else { "SELECT guid, url, title, visit_count, last_visit_date, description, preview_image_url FROM places WHERE last_visit_date > ? OR last_visit_date IS NULL ORDER BY last_visit_date ASC" })?;
         for row in fetch_places.query_map([places_min_ts], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+            let description = row.get_ref(5)?;
+            let description = match description {
+                ValueRef::Null => None,
+                ValueRef::Text(x) => Some(String::from_utf8_lossy(x).to_string()),
+                _ => panic!("unexpected type")
+            };
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, description, row.get(6)?))
         })? {
             let row = row?;
             places.blocking_send(row)?;

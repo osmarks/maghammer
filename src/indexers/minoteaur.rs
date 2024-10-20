@@ -6,6 +6,7 @@ use crate::util::hash_str;
 use crate::indexer::{Ctx, Indexer, TableSpec, ColumnSpec};
 use chrono::prelude::*;
 use rusqlite::OpenFlags;
+use tracing::instrument;
 
 #[derive(Serialize, Deserialize)]
 struct Config {
@@ -255,59 +256,9 @@ CREATE TABLE IF NOT EXISTS mino_files (
             let last_view_timestamp: DateTime<Utc> = row.get(2);
             timestamps.insert(ulid::Ulid::from_string(&ulid)?, (updated, last_view_timestamp));
         }
-        
+
         while let Some((id, object)) = rx.recv().await {
-            match object {
-                minoteaur_types::Object::Page(page) => {
-                    // If we already have the latest information on this page, skip it.
-                    if let Some((updated_timestamp, _last_view_timestamp)) = timestamps.get(&id) {
-                        if *updated_timestamp >= page.updated {
-                            continue;
-                        }
-                    }
-                    let ulid = id.to_string();
-                    let int_id = hash_str(&ulid);
-                    let tx = conn.transaction().await?;
-                    tx.execute("DELETE FROM mino_pages WHERE id = $1", &[&int_id]).await?;
-                    tx.execute("INSERT INTO mino_pages VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, 0, $10)",
-                        &[&int_id, &ulid, &page.updated, &page.created, &page.title, &(page.size.words as i32), &page.tags.into_iter().collect::<Vec<String>>(), &page.names.into_iter().collect::<Vec<String>>(), &page.content, &page.created])
-                        .await?;
-                    for (key, value) in page.structured_data {
-                        let (num, text) = match value {
-                            minoteaur_types::Value::Number(x) => (Some(x), None),
-                            minoteaur_types::Value::Text(t) => (None, Some(t))
-                        };
-                        tx.execute("INSERT INTO mino_structured_data (page, key, numeric_value, text_value) VALUES ($1, $2, $3, $4)", &[&int_id, &key, &num, &text]).await?;
-                    }
-                    for (_key, file) in page.files {
-                        tx.execute("INSERT INTO mino_files (page, filename, size, timestamp, metadata) VALUES ($1, $2, $3, $4, $5)", &[&int_id, &file.filename, &(file.size as i32), &file.created, &tokio_postgres::types::Json(file.metadata)]).await?;
-                    }
-                    tx.commit().await?;
-                },
-                // These should only occur after the page's record, with the exception of page creation.
-                minoteaur_types::Object::PageView(view) => {
-                    if let Some((_updated_timestamp, last_view_timestamp)) = timestamps.get(&view.page) {
-                        if *last_view_timestamp >= view.time {
-                            continue;
-                        }
-                    }
-                    let int_id = hash_str(&view.page.to_string());
-                    conn.execute("UPDATE mino_pages SET view_count = view_count + 1, last_view_timestamp = $2 WHERE id = $1", &[&int_id, &view.time]).await?;
-                },
-                minoteaur_types::Object::Revision(rev) => {
-                    // There's no separate "last revision timestamp" because revisions should always be associated with the updated field being adjusted.
-                    if let Some((updated_timestamp, _last_view_timestamp)) = timestamps.get(&rev.page) {
-                        if *updated_timestamp >= rev.time {
-                            continue;
-                        }
-                    }
-                    if let minoteaur_types::RevisionType::PageCreated = rev.ty {
-                        continue;
-                    }
-                    let int_id = hash_str(&rev.page.to_string());
-                    conn.execute("UPDATE mino_pages SET revision_count = revision_count + 1 WHERE id = $1", &[&int_id]).await?;
-                }
-            }
+            MinoteaurIndexer::write_object(&mut conn, id, object, &timestamps).await?;
         }
 
         // Minoteaur doesn't have a delete button so not supporting deletes is clearly fine, probably.
@@ -342,6 +293,62 @@ impl MinoteaurIndexer {
         })? {
             let (id, data) = row?;
             target.blocking_send((ulid::Ulid::from_bytes(id.try_into().map_err(|_| anyhow!("conversion failure"))?), rmp_serde::decode::from_slice(&data).context("parse object")?))?;
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(conn, timestamps))]
+    async fn write_object(conn: &mut tokio_postgres::Client, id: ulid::Ulid, object: minoteaur_types::Object, timestamps: &HashMap<ulid::Ulid, (DateTime<Utc>, DateTime<Utc>)>) -> Result<()> {
+        match object {
+            minoteaur_types::Object::Page(page) => {
+                // If we already have the latest information on this page, skip it.
+                if let Some((updated_timestamp, _last_view_timestamp)) = timestamps.get(&id) {
+                    if *updated_timestamp >= page.updated {
+                        return Ok(());
+                    }
+                }
+                let ulid = id.to_string();
+                let int_id = hash_str(&ulid);
+                let tx = conn.transaction().await?;
+                tx.execute("DELETE FROM mino_pages WHERE id = $1", &[&int_id]).await?;
+                tx.execute("INSERT INTO mino_pages VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, 0, $10)",
+                    &[&int_id, &ulid, &page.updated, &page.created, &page.title, &(page.size.words as i32), &page.tags.into_iter().collect::<Vec<String>>(), &page.names.into_iter().collect::<Vec<String>>(), &page.content, &page.created])
+                    .await?;
+                for (key, value) in page.structured_data {
+                    let (num, text) = match value {
+                        minoteaur_types::Value::Number(x) => (Some(x), None),
+                        minoteaur_types::Value::Text(t) => (None, Some(t))
+                    };
+                    tx.execute("INSERT INTO mino_structured_data (page, key, numeric_value, text_value) VALUES ($1, $2, $3, $4)", &[&int_id, &key, &num, &text]).await?;
+                }
+                for (_key, file) in page.files {
+                    tx.execute("INSERT INTO mino_files (page, filename, size, timestamp, metadata) VALUES ($1, $2, $3, $4, $5)", &[&int_id, &file.filename, &(file.size as i32), &file.created, &tokio_postgres::types::Json(file.metadata)]).await?;
+                }
+                tx.commit().await?;
+            },
+            // These should only occur after the page's record, with the exception of page creation.
+            minoteaur_types::Object::PageView(view) => {
+                if let Some((_updated_timestamp, last_view_timestamp)) = timestamps.get(&view.page) {
+                    if *last_view_timestamp >= view.time {
+                        return Ok(());
+                    }
+                }
+                let int_id = hash_str(&view.page.to_string());
+                conn.execute("UPDATE mino_pages SET view_count = view_count + 1, last_view_timestamp = $2 WHERE id = $1", &[&int_id, &view.time]).await?;
+            },
+            minoteaur_types::Object::Revision(rev) => {
+                // There's no separate "last revision timestamp" because revisions should always be associated with the updated field being adjusted.
+                if let Some((updated_timestamp, _last_view_timestamp)) = timestamps.get(&rev.page) {
+                    if *updated_timestamp >= rev.time {
+                        return Ok(());
+                    }
+                }
+                if let minoteaur_types::RevisionType::PageCreated = rev.ty {
+                    return Ok(());
+                }
+                let int_id = hash_str(&rev.page.to_string());
+                conn.execute("UPDATE mino_pages SET revision_count = revision_count + 1 WHERE id = $1", &[&int_id]).await?;
+            }
         }
         Ok(())
     }

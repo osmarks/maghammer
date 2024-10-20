@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 use futures::{StreamExt, TryStreamExt};
+use lazy_static::lazy_static;
 use pgvector::HalfVector;
 use tokenizers::{tokenizer::{Error, Tokenizer}, Encoding};
 use anyhow::{Result, anyhow};
@@ -9,8 +10,15 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use std::fmt::Write;
 use half::f16;
+use tracing::instrument;
 
-use crate::{indexer::{ColumnSpec, Indexer, TableSpec}, util::{get_column_string, CONFIG}};
+use crate::{indexer::{ColumnSpec, Indexer, TableSpec}, util::{self, get_column_string, CONFIG}};
+
+// sorry.
+// https://gist.github.com/hanxiao/3f60354cf6dc5ac698bc9154163b4e6a
+lazy_static! {
+    static ref CHUNKING_REGEX: pcre2::bytes::Regex = pcre2::bytes::RegexBuilder::new().utf(true).jit_if_available(true).multi_line(true).build(r#"((?:^(?:[#*=-]{1,7}|\w[^\r\n]{0,200}\r?\n[-=]{2,200}|<h[1-6][^>]{0,100}>)[^\r\n]{1,200}(?:<\/h[1-6]>)?(?:\r?\n|$))|(?:\[[0-9]+\][^\r\n]{1,800})|(?:(?:^|\r?\n)[ \t]{0,3}(?:[-*+•]|\d{1,3}\.\w\.|\[[ xX]\])[ \t]+(?![.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]\s)(?:[^\r\n]{1,200}(?:(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)|(?=[\r\n]|$))|[^\r\n]{1,200}(?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]|(?:'(?=`)|''(?=``)))(?:(?:(?!(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)).){1,100}(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$))?)[\s\]})>,']*(?:(?:\r?\n[ \t]{2,5}(?:[-*+•]|\d{1,3}\.\w\.|\[[ xX]\])[ \t]+(?![.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]\s)(?:[^\r\n]{1,200}(?:(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)|(?=[\r\n]|$))|[^\r\n]{1,200}(?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]|(?:'(?=`)|''(?=``)))(?:(?:(?!(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)).){1,100}(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$))?)[\s\]})>,']*){0,6}(?:\r?\n[ \t]{4,7}(?:[-*+•]|\d{1,3}\.\w\.|\[[ xX]\])[ \t]+(?![.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]\s)(?:[^\r\n]{1,200}(?:(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)|(?=[\r\n]|$))|[^\r\n]{1,200}(?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]|(?:'(?=`)|''(?=``)))(?:(?:(?!(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)).){1,100}(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$))?)[\s\]})>,']*){0,6})?)|(?:(?:^>(?:>|\s{2,}){0,2}(?![.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]\s)(?:[^\r\n]{1,200}(?:(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)|(?=[\r\n]|$))|[^\r\n]{1,200}(?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]|(?:'(?=`)|''(?=``)))(?:(?:(?!(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)).){1,100}(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$))?)[\s\]})>,']*\r?\n?){1,15})|(?:(?:^|\r?\n)(?:```|~~~)(?:\w{0,20})?\r?\n[\s\S]{0,1500}?(?:```|~~~)\r?\n?|(?:(?:^|\r?\n)(?: {4}|\t)[^\r\n]{0,200}(?:\r?\n(?: {4}|\t)[^\r\n]{0,200}){0,20}\r?\n?)|(?:<pre>(?:<code>)?[\s\S]{0,1500}?(?:<\/code>)?<\/pre>))|(?:(?:^|\r?\n)(?:\|[^\r\n]{0,200}\|(?:\r?\n\|[-:]{1,200}\|){0,1}(?:\r?\n\|[^\r\n]{0,200}\|){0,20}|<table>[\s\S]{0,2000}?<\/table>))|(?:^(?:[-*_]){3,}\s*$|<hr\s*\/?>)|(?![\s\]})>,'])(?:^(?:<[a-zA-Z][^>]{0,100}>)?(?![.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]\s)(?:[^\r\n]{1,800}(?:(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)|(?=[\r\n]|$))|[^\r\n]{1,800}(?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]|(?:'(?=`)|''(?=``)))(?:(?:(?!(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)).){1,100}(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$))?)[\s\]})>,']*(?:<\/[a-zA-Z]+>)?(?:\r?\n|$))|(?![\s\]})>,'])(?![.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]\s)(?:[^\r\n]{1,400}(?:(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)|(?=[\r\n]|$))|[^\r\n]{1,400}(?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]|(?:'(?=`)|''(?=``)))(?:(?:(?!(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)).){1,100}(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$))?)[\s\]})>,']*|(?:(?<!\w)"""[^"]{0,300}"""(?!\w)|(?<!\w)(?:['"`'"])[^\r\n]{0,300}\1(?!\w)|(?<!\w)`[^\r\n]{0,300}'(?!\w)|(?<!\w)``[^\r\n]{0,300}''(?!\w)|\([^\r\n()]{0,200}(?:\([^\r\n()]{0,200}\)[^\r\n()]{0,200}){0,5}\)|\[[^\r\n\[\]]{0,200}(?:\[[^\r\n\[\]]{0,200}\][^\r\n\[\]]{0,200}){0,5}\]|\$[^\r\n$]{0,100}\$|`[^`\r\n]{0,100}`)|(?![\s\]})>,'])(?:(?:^|\r?\n\r?\n)(?:<p>)?(?![.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]\s)(?:[^\r\n]{1,1000}(?:(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)|(?=[\r\n]|$))|[^\r\n]{1,1000}(?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]|(?:'(?=`)|''(?=``)))(?:(?:(?!(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)).){1,100}(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$))?)[\s\]})>,']*(?:<\/p>)?(?=\r?\n\r?\n|$))|(?:<[a-zA-Z][^>]{0,100}(?:>[\s\S]{0,1000}?<\/[a-zA-Z]+>|\s*\/>))|(?:(?:\$\$[\s\S]{0,500}?\$\$)|(?:\$[^\$\r\n]{0,100}\$))|(?![\s\]})>,'])(?![.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]\s)(?:[^\r\n]{1,800}(?:(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)|(?=[\r\n]|$))|[^\r\n]{1,800}(?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]|(?:'(?=`)|''(?=``)))(?:(?:(?!(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$)).){1,100}(?:[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}](?<![\s\]})>,'](?=[.!?…]|\.{3}|[\x{2026}\x{2047}-\x{2049}]|[\p{Emoji_Presentation}\p{Extended_Pictographic}]))|(?:'(?=`)|''(?=``)))(?=\S|$))?)[\s\]})>,']*)"#).unwrap();
+}
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct SemanticSearchConfig {
@@ -31,24 +39,52 @@ pub fn load_tokenizer() -> Result<Tokenizer> {
     Ok(tokenizer)
 }
 
+#[instrument(skip(t))]
 pub fn tokenize_chunk_text(t: &Tokenizer, s: &str) -> Result<Vec<(usize, usize, String)>> {
-    let enc = t.encode(s, false).map_err(convert_tokenizer_error)?;
     let mut result = vec![];
-    let mut write = |enc: &Encoding| -> Result<()> {
-        if !enc.get_offsets().is_empty() {
-            let offsets: Vec<(usize, usize)> = enc.get_offsets().into_iter().copied().filter(|(a, b)| *a != 0 || *b != 0).collect();
-            result.push((
-                offsets[0].0,
-                offsets[offsets.len() - 1].1,
-                t.decode(enc.get_ids(), true).map_err(convert_tokenizer_error)?
-            ));
-        }
-        Ok(())
-    };
-    write(&enc)?;
-    for overflowing in enc.get_overflowing() {
-        write(overflowing)?;
+
+    let mut raw_regions = vec![];
+
+    // use inscrutable semantic chunking regex, then use tokenizer to split in case some chunks are too long still
+    for mat in CHUNKING_REGEX.find_iter(s.as_bytes()) {
+        let mat = mat?;
+        let range = mat.start()..mat.end();
+        let region = &s[range];
+        raw_regions.push((mat.start(), t.encode(region, false).map_err(convert_tokenizer_error)?.len()));
     }
+
+    raw_regions.push((s.len(), CONFIG.semantic.max_tokens));
+
+    let mut new_chunk_start = 0;
+    let mut new_chunk_token_length = 0;
+
+    for ((_region_start, token_length), (next_region_start, next_token_length)) in raw_regions.iter().zip(raw_regions.iter().skip(1)) {
+        new_chunk_token_length += token_length;
+        if new_chunk_token_length + next_token_length > util::CONFIG.semantic.max_tokens {
+            let enc = t.encode(&s[new_chunk_start..*next_region_start], false).map_err(convert_tokenizer_error)?;
+
+            let mut write = |enc: &Encoding| -> Result<()> {
+                if !enc.get_offsets().is_empty() {
+                    let offsets: Vec<(usize, usize)> = enc.get_offsets().into_iter().copied().filter(|(a, b)| *a != 0 || *b != 0).collect();
+                    result.push((
+                        new_chunk_start + offsets[0].0,
+                        new_chunk_start + offsets[offsets.len() - 1].1,
+                        t.decode(enc.get_ids(), true).map_err(convert_tokenizer_error)?
+                    ));
+                }
+                Ok(())
+            };
+
+            write(&enc)?;
+            for overflowing in enc.get_overflowing() {
+                write(overflowing)?;
+            }
+
+            new_chunk_start = *next_region_start;
+            new_chunk_token_length = 0;
+        }
+    }
+
     Ok(result)
 }
 
@@ -66,6 +102,7 @@ fn decode_fp16_buffer(buf: &[u8]) -> Vec<f16> {
         .collect()
 }
 
+#[instrument(skip(client))]
 async fn send_batch(client: &Client, batch: Vec<&str>) -> Result<Vec<Vec<f16>>> {
     let res = client.post(&CONFIG.semantic.backend)
         .body(rmp_serde::to_vec_named(&EmbeddingRequest { text: batch })?)
@@ -84,6 +121,7 @@ struct Chunk {
     text: String
 }
 
+#[derive(Debug)]
 pub struct SemanticCtx {
     tokenizer: Tokenizer,
     client: reqwest::Client,
@@ -98,6 +136,7 @@ impl SemanticCtx {
 
 // This is only called when we have all chunks for a document ready, so we delete the change record
 // and all associated FTS chunks.
+#[instrument(skip(table, ctx, chunks))]
 async fn insert_fts_chunks(id: i64, chunks: Vec<(Chunk, Vec<f16>)>, table: &TableSpec, ctx: Arc<SemanticCtx>) -> Result<()> {
     let mut conn = ctx.pool.get().await?;
     let tx = conn.transaction().await?;
@@ -127,6 +166,7 @@ pub async fn embed_query(q: &str, ctx: Arc<SemanticCtx>) -> Result<(HalfVector, 
     Ok((HalfVector::from(result.next().unwrap()), HalfVector::from(result.next().unwrap())))
 }
 
+#[instrument(skip(ctx))]
 pub async fn fts_for_indexer(i: &Box<dyn Indexer>, ctx: Arc<SemanticCtx>) -> Result<()> {
     let conn = ctx.pool.get().await?;
     for table in i.tables() {
@@ -163,7 +203,10 @@ pub async fn fts_for_indexer(i: &Box<dyn Indexer>, ctx: Arc<SemanticCtx>) -> Res
                             for (i, col) in fts_columns.iter().enumerate() {
                                 let s: Option<String> = get_column_string(&row, i + 1, col);
                                 if let Some(s) = s {
-                                    let chunks = tokio::task::block_in_place(|| tokenize_chunk_text(&ctx.tokenizer, &s))?;
+                                    let ctx = ctx.clone();
+                                    let chunks = tokio::task::spawn_blocking(move || {
+                                        tokenize_chunk_text(&ctx.tokenizer, &s)
+                                    }).await??;
                                     for chunk in chunks {
                                         buffer.push(Chunk {
                                             id,
@@ -227,5 +270,5 @@ pub async fn fts_for_indexer(i: &Box<dyn Indexer>, ctx: Arc<SemanticCtx>) -> Res
 
 #[test]
 fn test_tokenize() {
-    println!("{:?}", tokenize_chunk_text(&load_tokenizer().unwrap(), "test input"));
+    println!("{:?}", tokenize_chunk_text(&load_tokenizer().unwrap(), include_str!("../tokenizer_test_input.txt")));
 }

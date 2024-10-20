@@ -6,13 +6,14 @@ use compact_str::CompactString;
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tracing::instrument;
 use crate::util::{hash_str, parse_html, parse_pdf, systemtime_to_utc, urlencode, CONFIG};
 use crate::indexer::{Ctx, Indexer, TableSpec, delete_nonexistent_files, ColumnSpec};
 use async_walkdir::WalkDir;
 use chrono::prelude::*;
 use regex::RegexSet;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Config {
     path: String,
     #[serde(default)]
@@ -20,6 +21,7 @@ struct Config {
     base_url: String
 }
 
+#[derive(Debug)]
 pub struct TextFilesIndexer {
     config: Config,
     ignore: RegexSet
@@ -89,58 +91,11 @@ CREATE TABLE text_files (
 
         let existing_files = Arc::new(RwLock::new(HashSet::new()));
 
-        entries.map_err(|e| anyhow::Error::from(e)).try_for_each_concurrent(Some(CONFIG.concurrency), |entry| 
+        entries.map_err(|e| anyhow::Error::from(e)).try_for_each_concurrent(Some(CONFIG.concurrency), |entry|
             {
                 let ctx = ctx.clone();
                 let existing_files = existing_files.clone();
-                async move {
-                    let real_path = entry.path();
-                    let path = if let Some(path) = real_path.strip_prefix(base_path)?.to_str() {
-                        path
-                    } else {
-                        return Result::Ok(());
-                    };
-                    let ext = real_path.extension().and_then(OsStr::to_str);
-                    if ignore.is_match(path) || !entry.file_type().await?.is_file() || !VALID_EXTENSIONS.contains(ext.unwrap_or_default()) {
-                        return Ok(());
-                    }
-                    let mut conn = ctx.pool.get().await?;
-                    existing_files.write().await.insert(CompactString::from(path));
-                    let metadata = entry.metadata().await?;
-                    let row = conn.query_opt("SELECT timestamp FROM text_files WHERE id = $1", &[&hash_str(path)]).await?;
-                    let timestamp: DateTime<Utc> = row.map(|r| r.get(0)).unwrap_or(DateTime::<Utc>::MIN_UTC);
-                    let modtime = systemtime_to_utc(metadata.modified()?)?;
-                    if modtime > timestamp {
-                        let parse = match ext {
-                            Some("pdf") => {
-                                parse_pdf(&real_path).await.map(Some)
-                            },
-                            Some("txt") => {
-                                let content = tokio::fs::read(&real_path).await?;
-                                Ok(Some((String::from_utf8_lossy(&content).to_string(), String::new())))
-                            },
-                            Some("htm") | Some("html") | Some("xhtml") => {
-                                let content = tokio::fs::read(&real_path).await?;
-                                Ok(Some(tokio::task::block_in_place(|| parse_html(&content, true))))
-                            },
-                            _ => Ok(None),
-                        };
-                        match parse {
-                            Ok(None) => (),
-                            Ok(Some((content, title))) => {
-                                // Null bytes aren't legal in Postgres strings despite being valid UTF-8.
-                                let tx = conn.transaction().await?;
-                                tx.execute("DELETE FROM text_files WHERE id = $1", &[&hash_str(path)]).await?;
-                                tx.execute("INSERT INTO text_files VALUES ($1, $2, $3, $4, $5)",
-                                    &[&hash_str(path), &path, &title.replace("\0", ""), &content.replace("\0", ""), &modtime])
-                                    .await?;
-                                tx.commit().await?;
-                            },
-                            Err(e) => log::warn!("File parse for {}: {}", path, e)
-                        }
-                    }
-                    Result::Ok(())
-                }
+                TextFilesIndexer::process_file(entry, ctx, ignore, existing_files, base_path)
         }).await?;
 
         {
@@ -163,5 +118,60 @@ impl TextFilesIndexer {
             ignore: RegexSet::new(&config.ignore_regexes)?,
             config
         }))
+    }
+
+    #[instrument(skip(ctx, ignore, existing_files, base_path))]
+    async fn process_file(entry: async_walkdir::DirEntry, ctx: Arc<Ctx>, ignore: &RegexSet, existing_files: Arc<RwLock<HashSet<CompactString>>>, base_path: &String) -> Result<()> {
+        let real_path = entry.path();
+        let path = if let Some(path) = real_path.strip_prefix(base_path)?.to_str() {
+            path
+        } else {
+            return Result::Ok(());
+        };
+        let ext = real_path.extension().and_then(OsStr::to_str);
+        if ignore.is_match(path) || !entry.file_type().await?.is_file() || !VALID_EXTENSIONS.contains(ext.unwrap_or_default()) {
+            return Ok(());
+        }
+        let mut conn = ctx.pool.get().await?;
+        existing_files.write().await.insert(CompactString::from(path));
+        let metadata = entry.metadata().await?;
+        let row = conn.query_opt("SELECT timestamp FROM text_files WHERE id = $1", &[&hash_str(path)]).await?;
+        let timestamp: DateTime<Utc> = row.map(|r| r.get(0)).unwrap_or(DateTime::<Utc>::MIN_UTC);
+        let modtime = systemtime_to_utc(metadata.modified()?)?;
+        if modtime > timestamp {
+            let parse = TextFilesIndexer::read_file(&real_path, ext).await;
+            match parse {
+                Ok(None) => (),
+                Ok(Some((content, title))) => {
+                    // Null bytes aren't legal in Postgres strings despite being valid UTF-8.
+                    let tx = conn.transaction().await?;
+                    tx.execute("DELETE FROM text_files WHERE id = $1", &[&hash_str(path)]).await?;
+                    tx.execute("INSERT INTO text_files VALUES ($1, $2, $3, $4, $5)",
+                        &[&hash_str(path), &path, &title.replace("\0", ""), &content.replace("\0", ""), &modtime])
+                        .await?;
+                    tx.commit().await?;
+                },
+                Err(e) => tracing::warn!("File parse for {}: {}", path, e)
+            }
+        }
+        Ok(())
+    }
+
+    #[instrument]
+    async fn read_file(path: &std::path::PathBuf, ext: Option<&str>) -> Result<Option<(String, String)>> {
+        match ext {
+            Some("pdf") => {
+                parse_pdf(&path).await.map(Some)
+            },
+            Some("txt") => {
+                let content = tokio::fs::read(&path).await?;
+                Ok(Some((String::from_utf8_lossy(&content).to_string(), String::new())))
+            },
+            Some("htm") | Some("html") | Some("xhtml") => {
+                let content = tokio::fs::read(&path).await?;
+                Ok(Some(tokio::task::block_in_place(|| parse_html(&content, true))))
+            },
+            _ => Ok(None),
+        }
     }
 }

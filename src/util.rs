@@ -6,6 +6,7 @@ use seahash::SeaHasher;
 use serde::{Serialize, Deserialize};
 use tokio_postgres::Row;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use tracing::instrument;
 
 const FRAGMENT: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').add(b'`');
 
@@ -57,6 +58,7 @@ lazy_static::lazy_static! {
     static ref SPACE_ON_NEWLINES: Regex = Regex::new(r"\n\s+").unwrap();
 }
 
+#[instrument(skip(html))]
 pub fn parse_html(html: &[u8], prefer_title_tag: bool) -> (String, String) {
     use html5gum::Token;
 
@@ -135,6 +137,7 @@ pub fn parse_html(html: &[u8], prefer_title_tag: bool) -> (String, String) {
     (NEWLINES.replace_all(&SPACE_ON_NEWLINES.replace_all(&text, "\n"), "\n\n").trim().to_string(), title)
 }
 
+#[instrument]
 pub async fn parse_pdf(path: &PathBuf) -> Result<(String, String)> {
     // Rust does not seem to have a robust library for this.
     let res = tokio::process::Command::new("pdftotext")

@@ -11,9 +11,10 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 use crate::util::{hash_str, parse_date, parse_html, systemtime_to_utc, urlencode, CONFIG};
 use crate::indexer::{Ctx, Indexer, TableSpec, delete_nonexistent_files, ColumnSpec};
-use async_walkdir::WalkDir;
+use async_walkdir::{Filtering, WalkDir};
 use chrono::prelude::*;
 use regex::{RegexSet, Regex};
+use tracing::instrument;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Config {
@@ -89,6 +90,7 @@ struct Stream {
 #[derive(Deserialize, Debug)]
 struct Format {
     duration: String,
+    #[serde(default)]
     tags: HashMap<String, String>
 }
 
@@ -106,10 +108,10 @@ lazy_static::lazy_static! {
 
 fn parse_duration(s: &str) -> Result<f32> {
     let mat = DURATION_STRING.captures(s).context("duration misformatted")?;
-    let duration = f32::from_str(mat.get(1).unwrap().as_str())? * 3600.0 
+    let duration = f32::from_str(mat.get(1).unwrap().as_str())? * 3600.0
         + f32::from_str(mat.get(2).unwrap().as_str())? * 60.0
         + f32::from_str(&mat.get(3).unwrap().as_str().replace(",", "."))?;
- 
+
    Ok(duration)
 }
 
@@ -129,6 +131,7 @@ enum SRTParseState {
     ExpectData
 }
 
+#[instrument(skip(srt))]
 fn parse_srt(srt: &str) -> Result<String> {
     use SRTParseState::*;
 
@@ -176,7 +179,7 @@ fn parse_filename(path: &PathBuf) -> Option<(String, String, Option<i32>, Option
         let ep = i32::from_str(mat.get(2).unwrap().as_str()).unwrap();
         Some((dirname.to_string(), name.to_string(), Some(se), Some(ep)))
     } else {
-        Some((dirname.to_string(), stem.to_string(), None, None))    
+        Some((dirname.to_string(), stem.to_string(), None, None))
     }
 }
 
@@ -208,7 +211,7 @@ mod test {
 
         let mut s = String::new();
         format_duration(parse_duration("00:01:02,410").unwrap(), &mut s);
-        assert_eq!(s, "00:01:02.410");
+        assert_eq!(s, "00:01:02");
     }
 }
 
@@ -253,7 +256,9 @@ fn score_subtitle_stream(stream: &Stream, others: &Vec<Stream>, parse_so_far: &M
     1
 }
 
+#[instrument]
 async fn parse_media(path: &PathBuf, ignore: Arc<RegexSet>) -> Result<MediaParse> {
+    tracing::trace!("starting ffprobe");
     let ffmpeg = Command::new("ffprobe")
         .arg("-hide_banner")
         .arg("-print_format").arg("json")
@@ -266,6 +271,7 @@ async fn parse_media(path: &PathBuf, ignore: Arc<RegexSet>) -> Result<MediaParse
     if !ffmpeg.status.success() {
         return Err(anyhow!("ffmpeg failure: {}", String::from_utf8_lossy(&ffmpeg.stderr)))
     }
+    tracing::trace!("ffprobe successful");
     let probe: Probe = serde_json::from_slice(&ffmpeg.stdout).context("ffmpeg parse")?;
 
     let mut result = MediaParse {
@@ -336,6 +342,8 @@ async fn parse_media(path: &PathBuf, ignore: Arc<RegexSet>) -> Result<MediaParse
 
     // if we have any remotely acceptable subtitles, use ffmpeg to read them out
     if best_subtitle_track.1 > i8::MIN {
+        tracing::trace!("reading subtitle track {:?}", best_subtitle_track);
+
         let ffmpeg = Command::new("ffmpeg")
             .arg("-hide_banner").arg("-v").arg("quiet")
             .arg("-i").arg(path)
@@ -463,13 +471,30 @@ CREATE TABLE media_files (
 
     async fn run(&self, ctx: Arc<Ctx>) -> Result<()> {
         let entries = WalkDir::new(&self.config.path);
-        let ignore = &self.ignore_files;
-        let base_path = &self.config.path;
+        let ignore = Arc::new(self.ignore_files.clone());
+        let base_path = Arc::new(self.config.path.clone());
+        let base_path_ = base_path.clone();
         let ignore_metadata = self.ignore_metadata.clone();
 
         let existing_files = Arc::new(RwLock::new(HashSet::new()));
+        let existing_files_ = existing_files.clone();
+        let ctx_ = ctx.clone();
 
         entries
+            .filter(move |entry| {
+                let ignore = ignore.clone();
+                let base_path = base_path.clone();
+                let path = entry.path();
+                tracing::trace!("filtering {:?}", path);
+                if let Some(path) = path.strip_prefix(&*base_path).ok().and_then(|x| x.to_str()) {
+                    if ignore.is_match(path) {
+                        return std::future::ready(Filtering::IgnoreDir);
+                    }
+                } else {
+                    return std::future::ready(Filtering::IgnoreDir);
+                }
+                std::future::ready(Filtering::Continue)
+            })
             .map_err(|e| anyhow::Error::from(e))
             .filter(|r| {
                 // ignore permissions errors because things apparently break otherwise
@@ -479,18 +504,20 @@ CREATE TABLE media_files (
                 };
                 async move { keep }
             })
-            .try_for_each_concurrent(Some(CONFIG.concurrency), |entry| {
-                let ctx = ctx.clone();
-                let existing_files = existing_files.clone();
+            .try_for_each_concurrent(Some(CONFIG.concurrency), move |entry| {
+                tracing::trace!("got file {:?}", entry.path());
+                let ctx = ctx_.clone();
+                let base_path = base_path_.clone();
+                let existing_files = existing_files_.clone();
                 let ignore_metadata = ignore_metadata.clone();
                 async move {
                     let real_path = entry.path();
-                    let path = if let Some(path) = real_path.strip_prefix(base_path)?.to_str() {
+                    let path = if let Some(path) = real_path.strip_prefix(&*base_path)?.to_str() {
                         path
                     } else {
                         return Result::Ok(());
                     };
-                    if ignore.is_match(path) || !entry.file_type().await?.is_file() {
+                    if !entry.file_type().await?.is_file() {
                         return Ok(());
                     }
                     let mut conn = ctx.pool.get().await?;
@@ -499,6 +526,7 @@ CREATE TABLE media_files (
                     let row = conn.query_opt("SELECT timestamp FROM media_files WHERE id = $1", &[&hash_str(path)]).await?;
                     let timestamp: DateTime<Utc> = row.map(|r| r.get(0)).unwrap_or(DateTime::<Utc>::MIN_UTC);
                     let modtime = systemtime_to_utc(metadata.modified()?)?;
+                    tracing::trace!("timestamp {:?}", timestamp);
                     if modtime > timestamp {
                         match parse_media(&real_path, ignore_metadata).await {
                             Ok(x) => {
@@ -526,9 +554,11 @@ CREATE TABLE media_files (
                                 tx.commit().await?;
                             },
                             Err(e) => {
-                                log::warn!("Media parse {}: {:?}", &path, e)
+                                tracing::warn!("Media parse {}: {:?}", &path, e)
                             }
                         }
+                    } else {
+                        tracing::trace!("skipping {:?}", path);
                     }
                     Result::Ok(())
                 }

@@ -1,5 +1,5 @@
 use std::{collections::HashSet, sync::Arc};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use compact_str::CompactString;
 use deadpool_postgres::Pool;
 use futures::{pin_mut, TryStreamExt};
@@ -62,14 +62,25 @@ pub trait Indexer: Sync + Send {
 
 pub async fn delete_nonexistent_files(ctx: Arc<Ctx>, select_paths: &str, delete_by_id: &str, existing: &HashSet<CompactString>) -> Result<()> {
     let conn = ctx.pool.get().await?;
+    let mut conn2 = ctx.pool.get().await?;
+    let tx = conn2.transaction().await?;
     let it = conn.query_raw(select_paths, [""; 0]).await?;
     pin_mut!(it);
     while let Some(row) = it.try_next().await? {
         let path: String = row.get(0);
         let path = CompactString::from(path);
         if !existing.contains(&path) {
-            conn.execute(delete_by_id, &[&hash_str(&path)]).await?;
+            tx.execute(delete_by_id, &[&hash_str(&path)]).await?;
         }
     }
+    tx.commit().await?;
     Ok(())
+}
+
+impl std::fmt::Debug for dyn Indexer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Indexer")
+            .field("name", &self.name())
+            .finish()
+    }
 }

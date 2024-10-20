@@ -6,6 +6,7 @@ use crate::{indexer::{ColumnSpec, Ctx, Indexer, TableSpec}, util::hash_str};
 use chrono::prelude::*;
 use tokio_postgres::{binary_copy::BinaryCopyInWriter, types::Type};
 use rusqlite::OpenFlags;
+use tracing::instrument;
 
 #[derive(Serialize, Deserialize)]
 struct Config {
@@ -47,7 +48,7 @@ CREATE TABLE shell_history (
                     ColumnSpec {
                         name: "command",
                         fts: true,
-                        fts_short: false,
+                        fts_short: true,
                         trigram: false,
                         is_array: false
                     },
@@ -68,7 +69,7 @@ CREATE TABLE shell_history (
         let max_timestamp = conn.query_one("SELECT max(timestamp) FROM shell_history", &[]).await?.get::<_, Option<DateTime<Utc>>>(0);
         let max_timestamp = max_timestamp.map(|x| x.timestamp_nanos_opt().unwrap() + 999).unwrap_or(0); // my code had better not be deployed unchanged in 2262; we have to add 1000 because of Postgres timestamp rounding
         let bg = tokio::task::spawn_blocking(move || self.read_database(tx, max_timestamp));
-        
+
         let sink = conn.copy_in("COPY shell_history (id, timestamp, command, cwd, duration, exit, hostname, session) FROM STDIN BINARY").await?;
 
         let writer = BinaryCopyInWriter::new(sink, &[Type::INT8, Type::TIMESTAMPTZ, Type::TEXT, Type::TEXT, Type::INT8, Type::INT4, Type::TEXT, Type::TEXT]);
@@ -103,6 +104,7 @@ impl AtuinIndexer {
         }))
     }
 
+    #[instrument(skip(self, target))]
     fn read_database(&self, target: tokio::sync::mpsc::Sender<(String, i64, i64, i32, String, String, String, String)>, min_timestamp: i64) -> Result<()> {
         let conn = rusqlite::Connection::open_with_flags(&self.config.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let mut fetch_stmt = conn.prepare("SELECT id, timestamp, duration, exit, command, cwd, session, hostname FROM history WHERE timestamp > ? ORDER BY timestamp ASC")?;

@@ -16,10 +16,9 @@ print("Models loaded.")
 BASE = "/media/"
 
 conn = psycopg2.connect("dbname=maghammer user=maghammer")
-conn2 = psycopg2.connect("dbname=maghammer user=maghammer")
-csr = conn.cursor()
-csr2 = conn.cursor()
-csr.execute("SELECT id, path FROM media_files WHERE auto_subs_state = 1") # PENDING
+with conn.cursor() as csr:
+    csr.execute("SELECT id, path FROM media_files WHERE auto_subs_state = 1") # PENDING
+    rows = csr.fetchall()
 
 def format_duration(seconds):
     hours = int(seconds / 3600.0)
@@ -29,7 +28,8 @@ def format_duration(seconds):
     full_seconds = int(seconds)
     return f"{hours:02}:{minutes:02}:{full_seconds:02}"
 
-while row := csr.fetchone():
+print(f"Processing {len(rows)} files...")
+for row in rows:
     file = row[1]
     docid = row[0]
     start = time.time()
@@ -55,5 +55,6 @@ while row := csr.fetchone():
             subs += f"[{format_duration(seg['start'])} -> {format_duration(seg['end'])}]: {seg['text'].strip()}\n"
         subs = subs.strip()
 
-    csr2.execute("UPDATE media_files SET subs = %s, auto_subs_state = 2 WHERE id = %s", (subs, docid)) # GENERATED
-    conn2.commit()
+    with conn.cursor() as csr:
+        csr.execute("UPDATE media_files SET subs = %s, auto_subs_state = 2 WHERE id = %s", (subs, docid)) # GENERATED
+    conn.commit()
