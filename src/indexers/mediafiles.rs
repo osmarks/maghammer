@@ -9,9 +9,8 @@ use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::sync::RwLock;
-use crate::util::{hash_str, parse_date, parse_html, systemtime_to_utc, urlencode, CONFIG};
+use crate::util::{hash_str, parse_date, parse_html, systemtime_to_utc, urlencode, CONFIG, async_walkdir};
 use crate::indexer::{Ctx, Indexer, TableSpec, delete_nonexistent_files, ColumnSpec};
-use async_walkdir::{Filtering, WalkDir};
 use chrono::prelude::*;
 use regex::{RegexSet, Regex};
 use tracing::instrument;
@@ -67,6 +66,7 @@ struct MediaParse {
 struct Chapter {
     start_time: String,
     end_time: String,
+    #[serde(default)]
     tags: HashMap<String, String>
 }
 
@@ -79,6 +79,7 @@ struct Disposition {
 struct Stream {
     index: usize,
     codec_name: Option<String>,
+    #[serde(default)]
     duration: Option<String>,
     codec_type: String,
     #[serde(default)]
@@ -89,7 +90,7 @@ struct Stream {
 
 #[derive(Deserialize, Debug)]
 struct Format {
-    duration: String,
+    duration: Option<String>,
     #[serde(default)]
     tags: HashMap<String, String>
 }
@@ -319,7 +320,7 @@ async fn parse_media(path: &PathBuf, ignore: Arc<RegexSet>) -> Result<MediaParse
         }
     }
 
-    result.duration = f32::from_str(&probe.format.duration)?;
+    result.duration = probe.format.duration.map(|x| f32::from_str(&x)).transpose()?.unwrap_or(0.0);
 
     let mut best_subtitle_track = (0, i8::MIN);
 
@@ -470,31 +471,31 @@ CREATE TABLE media_files (
     }
 
     async fn run(&self, ctx: Arc<Ctx>) -> Result<()> {
-        let entries = WalkDir::new(&self.config.path);
         let ignore = Arc::new(self.ignore_files.clone());
         let base_path = Arc::new(self.config.path.clone());
         let base_path_ = base_path.clone();
         let ignore_metadata = self.ignore_metadata.clone();
+
+        let entries = async_walkdir(self.config.path.clone().into(), true, move |entry| {
+            let ignore = ignore.clone();
+            let base_path = base_path.clone();
+            let path = entry.path();
+            tracing::trace!("filtering {:?}", path);
+            if let Some(path) = path.strip_prefix(&*base_path).ok().and_then(|x| x.to_str()) {
+                if ignore.is_match(path) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+            true
+        });
 
         let existing_files = Arc::new(RwLock::new(HashSet::new()));
         let existing_files_ = existing_files.clone();
         let ctx_ = ctx.clone();
 
         entries
-            .filter(move |entry| {
-                let ignore = ignore.clone();
-                let base_path = base_path.clone();
-                let path = entry.path();
-                tracing::trace!("filtering {:?}", path);
-                if let Some(path) = path.strip_prefix(&*base_path).ok().and_then(|x| x.to_str()) {
-                    if ignore.is_match(path) {
-                        return std::future::ready(Filtering::IgnoreDir);
-                    }
-                } else {
-                    return std::future::ready(Filtering::IgnoreDir);
-                }
-                std::future::ready(Filtering::Continue)
-            })
             .map_err(|e| anyhow::Error::from(e))
             .filter(|r| {
                 // ignore permissions errors because things apparently break otherwise
@@ -517,18 +518,18 @@ CREATE TABLE media_files (
                     } else {
                         return Result::Ok(());
                     };
-                    if !entry.file_type().await?.is_file() {
+                    if !entry.file_type().is_file() {
                         return Ok(());
                     }
                     let mut conn = ctx.pool.get().await?;
                     existing_files.write().await.insert(CompactString::from(path));
-                    let metadata = entry.metadata().await?;
+                    let metadata = tokio::fs::metadata(real_path).await?;
                     let row = conn.query_opt("SELECT timestamp FROM media_files WHERE id = $1", &[&hash_str(path)]).await?;
                     let timestamp: DateTime<Utc> = row.map(|r| r.get(0)).unwrap_or(DateTime::<Utc>::MIN_UTC);
                     let modtime = systemtime_to_utc(metadata.modified()?)?;
                     tracing::trace!("timestamp {:?}", timestamp);
                     if modtime > timestamp {
-                        match parse_media(&real_path, ignore_metadata).await {
+                        match parse_media(&real_path.to_path_buf(), ignore_metadata).await {
                             Ok(x) => {
                                 let tx = conn.transaction().await?;
                                 tx.execute("DELETE FROM media_files WHERE id = $1", &[&hash_str(path)]).await?;

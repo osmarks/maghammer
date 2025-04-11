@@ -2,12 +2,11 @@ use std::collections::HashSet;
 use std::{collections::HashMap, path::PathBuf};
 use std::sync::Arc;
 use anyhow::{Context, Result};
-use async_walkdir::WalkDir;
 use compact_str::ToCompactString;
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use crate::indexer::{Ctx, Indexer, TableSpec, ColumnSpec};
-use crate::util::{hash_thing, parse_html};
+use crate::util::{hash_thing, parse_html, async_walkdir};
 use chrono::prelude::*;
 use tokio::{fs::File, io::{AsyncBufReadExt, BufReader}};
 use mail_parser::MessageParser;
@@ -177,7 +176,7 @@ CREATE TABLE IF NOT EXISTS emails (
 
     async fn run(&self, ctx: Arc<Ctx>) -> Result<()> {
         let mut js: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
-        let mut entries = WalkDir::new(&self.config.mboxes_path);
+        let mut entries = async_walkdir(self.config.mboxes_path.clone().into(), false, |_| true);
         let config = self.config.clone();
         while let Some(entry) = entries.try_next().await? {
             let path = entry.path();
@@ -189,7 +188,7 @@ CREATE TABLE IF NOT EXISTS emails (
                 if let None = ext {
                     if !self.config.ignore_mboxes.contains(mbox.as_str()) {
                         let ctx = ctx.clone();
-                        js.spawn(EmailIndexer::process_mbox(ctx.clone(), path.clone(), mbox, folder, account.clone()));
+                        js.spawn(EmailIndexer::process_mbox(ctx.clone(), path.to_path_buf(), mbox, folder, account.clone()));
                     }
                 }
             }
@@ -237,10 +236,10 @@ impl EmailIndexer {
                     &mail.raw,
                     &account.as_str(),
                     &mbox.as_str(),
-                    &mail.from,
-                    &mail.from_address,
-                    &mail.subject,
-                    &body
+                    &mail.from.replace("\0", ""),
+                    &mail.from_address.replace("\0", ""),
+                    &mail.subject.replace("\0", ""),
+                    &body.replace("\0", "")
                 ]).await?;
                 Ok(())
             }

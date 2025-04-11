@@ -94,7 +94,7 @@ fn page(title: &str, body: Markup) -> web::HttpResponse {
 fn search_bar(ctx: &ServerState, value: &SearchQuery) -> Markup {
     html! {
         form.search-bar action="/search" {
-            input type="search" placeholder="Query" value=(value.q) name="q";
+            input type="search" placeholder="Query" value=(value.q) name="q" autofocus;
             select name="src_mode" {
                 option selected[value.src_mode == SearchSourceMode::Mix] { "Mix" }
                 option selected[value.src_mode == SearchSourceMode::Titles] { "Titles" }
@@ -108,7 +108,7 @@ fn search_bar(ctx: &ServerState, value: &SearchQuery) -> Markup {
                     }
                 }
             }
-            input type="submit" value="Search";
+            input type="submit" value="Search" autofocus;
         }
     }
 }
@@ -651,7 +651,7 @@ async fn query_one_table(table: &TableSpec, indexer: &'static str, col: &ColumnS
             let matchq_int = (*matchq * (i32::MAX as f64)) as i32;
             results.push(SearchResult {
                 docid: doc,
-                indexer: indexer,
+                indexer,
                 table: table.name,
                 column: col.name,
                 title: title.clone(),
@@ -667,9 +667,9 @@ async fn query_one_table(table: &TableSpec, indexer: &'static str, col: &ColumnS
 #[web::get("/search")]
 async fn fts_page(state: web::types::State<ServerState>, query: web::types::Query<SearchQuery>) -> impl web::Responder {
     let state = (*state).clone();
-    let (prefixed, unprefixed) = semantic::embed_query(&query.q, state.semantic.clone()).await?;
-    let prefixed = Arc::new(prefixed);
-    let unprefixed = Arc::new(unprefixed);
+    let (q_prefix, d_prefix) = semantic::embed_query(&query.q, state.semantic.clone()).await?;
+    let q_prefix = Arc::new(q_prefix);
+    let d_prefix = Arc::new(d_prefix);
     let mut results = HashMap::new();
 
     let mut set = tokio::task::JoinSet::new();
@@ -688,9 +688,9 @@ async fn fts_page(state: web::types::State<ServerState>, query: web::types::Quer
                 // Some columns are not like this (their spec says so) so we use the model for symmetric search.
                 // This does result in a different distribution of dot products.
                 let (embedding_choice, count) = if col.fts_short {
-                    (unprefixed.clone(), if query.src_mode == SearchSourceMode::Mix { 1 } else { 20 })
+                    (q_prefix.clone(), if query.src_mode == SearchSourceMode::Mix { 1 } else { 20 })
                 } else {
-                    (prefixed.clone(), 20)
+                    (q_prefix.clone(), 20)
                 };
                 set.spawn(query_one_table(table, ix.name(), col, state.clone(), count, embedding_choice));
             }

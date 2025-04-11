@@ -26,7 +26,9 @@ pub struct SemanticSearchConfig {
     backend: String,
     pub embedding_dim: u32,
     max_tokens: usize,
-    batch_size: usize
+    batch_size: usize,
+    document_prefix: String,
+    query_prefix: String
 }
 
 fn convert_tokenizer_error(e: Error) -> anyhow::Error {
@@ -102,6 +104,10 @@ fn decode_fp16_buffer(buf: &[u8]) -> Vec<f16> {
         .collect()
 }
 
+fn contains_nan(buf: &[f16]) -> bool {
+    buf.iter().any(|x| x.is_nan())
+}
+
 #[instrument(skip(client))]
 async fn send_batch(client: &Client, batch: Vec<&str>) -> Result<Vec<Vec<f16>>> {
     let res = client.post(&CONFIG.semantic.backend)
@@ -158,10 +164,11 @@ async fn insert_fts_chunks(id: i64, chunks: Vec<(Chunk, Vec<f16>)>, table: &Tabl
 }
 
 pub async fn embed_query(q: &str, ctx: Arc<SemanticCtx>) -> Result<(HalfVector, HalfVector)> {
-    let prefixed = format!("Represent this sentence for searching relevant passages: {}", q);
+    let query_prefixed = format!("{}{}", CONFIG.semantic.query_prefix, q);
+    let doc_prefixed = format!("{}{}", CONFIG.semantic.document_prefix, q);
     let mut result = send_batch(&ctx.client, vec![
-        &prefixed,
-        q
+        &query_prefixed,
+        &doc_prefixed
     ]).await?.into_iter();
     Ok((HalfVector::from(result.next().unwrap()), HalfVector::from(result.next().unwrap())))
 }
@@ -213,7 +220,7 @@ pub async fn fts_for_indexer(i: &Box<dyn Indexer>, ctx: Arc<SemanticCtx>) -> Res
                                             col: col.name,
                                             start: chunk.0 as i32,
                                             length: (chunk.1 - chunk.0) as i32,
-                                            text: chunk.2
+                                            text: format!("{}{}", CONFIG.semantic.document_prefix, chunk.2)
                                         });
                                     }
                                 }
@@ -242,6 +249,12 @@ pub async fn fts_for_indexer(i: &Box<dyn Indexer>, ctx: Arc<SemanticCtx>) -> Res
                         let mut pending = pending.write().await;
 
                         for (embedding, chunk) in embs.into_iter().zip(batch.into_iter()) {
+                            // ugly hack
+                            if contains_nan(&embedding) {
+                                // write no entries
+                                tokio::task::spawn(insert_fts_chunks(chunk.id, vec![], table, ctx.clone()));
+                            }
+
                             let record = pending.get_mut(&chunk.id).unwrap();
                             record.1 -= 1;
                             let id = chunk.id;
@@ -261,8 +274,8 @@ pub async fn fts_for_indexer(i: &Box<dyn Indexer>, ctx: Arc<SemanticCtx>) -> Res
 
             let make_embeddings: tokio::task::JoinHandle<Result<()>> = tokio::task::spawn(make_embeddings);
 
-            get_inputs.await??;
             make_embeddings.await??;
+            get_inputs.await??;
         }
     }
     Ok(())

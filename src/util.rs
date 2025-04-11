@@ -7,6 +7,8 @@ use serde::{Serialize, Deserialize};
 use tokio_postgres::Row;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use tracing::instrument;
+use futures::stream::Stream;
+use std::path::Path;
 
 const FRAGMENT: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').add(b'`');
 
@@ -178,4 +180,39 @@ pub fn get_column_string(row: &Row, index: usize, spec: &ColumnSpec) -> Option<S
 
 pub fn urlencode(s: &str) -> String {
     utf8_percent_encode(s, FRAGMENT).to_string()
+}
+
+// TODO: check the joinhandle somewhere
+struct AsyncWalkdirStream {
+    rx: tokio::sync::mpsc::Receiver<Result<walkdir::DirEntry>>,
+    handle: tokio::task::JoinHandle<Result<()>>
+}
+
+impl Stream for AsyncWalkdirStream {
+    type Item = Result<walkdir::DirEntry>;
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        match self.rx.poll_recv(cx) {
+            std::task::Poll::Ready(x) => std::task::Poll::Ready(x),
+            std::task::Poll::Pending => std::task::Poll::Pending
+        }
+    }
+}
+
+impl Drop for AsyncWalkdirStream {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+pub fn async_walkdir<F: Fn(&walkdir::DirEntry) -> bool + Send + 'static>(path: PathBuf, follow_symlinks: bool, filter: F) -> impl Stream<Item = Result<walkdir::DirEntry>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(128);
+    let handle = tokio::task::spawn_blocking(move || {
+        let walker = walkdir::WalkDir::new(path).follow_links(follow_symlinks).into_iter();
+        for entry in walker.filter_entry(|e| filter(&e)) {
+            tx.blocking_send(entry.map_err(|e| anyhow::Error::from(e)))?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    AsyncWalkdirStream { rx, handle }
 }

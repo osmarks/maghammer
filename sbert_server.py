@@ -14,13 +14,13 @@ from sentence_transformers import SentenceTransformer
 from prometheus_client import Counter, Histogram, REGISTRY, generate_latest
 
 device = torch.device("cuda:0")
-model_name = "./snowflake-arctic-embed-l"
+model_name = "./modernbert-embed-large"
 model = SentenceTransformer(model_name).half().to(device)
 model.eval()
 print("model loaded")
 
-MODELNAME = "sbert-snowflake-arctic-embed-l"
-BS = 256
+MODELNAME = "modernbert-embed-large"
+BS = 64
 
 InferenceParameters = collections.namedtuple("InferenceParameters", ["text", "callback"])
 
@@ -38,7 +38,7 @@ def do_inference(params: InferenceParameters):
             items_ctr.labels(MODELNAME, "text").inc(batch_size)
             with inference_time_hist.labels(MODELNAME, batch_size).time():
                 features = model(text)["sentence_embedding"]
-                features /= features.norm(dim=-1, keepdim=True)
+                features /= features.norm(dim=-1, keepdim=True) + 1e-5
                 features = features.cpu().numpy()
             batch_count_ctr.labels(MODELNAME).inc()
             callback(True, features)

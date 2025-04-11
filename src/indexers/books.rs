@@ -3,17 +3,17 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use anyhow::{Context, Result};
-use async_walkdir::{WalkDir, DirEntry};
 use compact_str::{CompactString, ToCompactString};
 use epub::doc::EpubDoc;
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use crate::util::{hash_str, parse_html, parse_date, systemtime_to_utc, CONFIG};
+use crate::util::{hash_str, parse_html, parse_date, systemtime_to_utc, CONFIG, async_walkdir};
 use crate::indexer::{delete_nonexistent_files, Ctx, Indexer, TableSpec, ColumnSpec};
 use chrono::prelude::*;
 use std::str::FromStr;
 use tracing::instrument;
+use walkdir::DirEntry;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Config {
@@ -91,14 +91,15 @@ async fn handle_epub(relpath: CompactString, ctx: Arc<Ctx>, entry: DirEntry, exi
     let epub = entry.path();
 
     let mut conn = ctx.pool.get().await?;
-    let metadata = entry.metadata().await?;
+    let metadata = tokio::fs::metadata(epub).await?;
     let row = conn.query_opt("SELECT timestamp FROM books WHERE id = $1", &[&hash_str(&relpath)]).await?;
     existing_files.write().await.insert(relpath.clone());
     let timestamp: DateTime<Utc> = row.map(|r| r.get(0)).unwrap_or(DateTime::<Utc>::MIN_UTC);
     let modtime = systemtime_to_utc(metadata.modified()?)?;
 
     if modtime > timestamp {
-        let parse_result = match tokio::task::spawn_blocking(move || parse_epub(&epub)).await? {
+        let pathbuf = epub.to_path_buf();
+        let parse_result = match tokio::task::spawn_blocking(move || parse_epub(&pathbuf)).await? {
             Ok(x) => x,
             Err(e) => {
                 tracing::warn!("Failed parse for {}: {}", relpath, e);
@@ -232,7 +233,7 @@ CREATE TABLE chapters (
     async fn run(&self, ctx: Arc<Ctx>) -> Result<()> {
         let existing_files = Arc::new(RwLock::new(HashSet::new()));
 
-        let entries = WalkDir::new(&self.config.path);
+        let entries = async_walkdir(self.config.path.clone().into(), false, |_| true);
         let base_path = &self.config.path;
 
         entries.map_err(|e| anyhow::Error::from(e)).try_for_each_concurrent(Some(CONFIG.concurrency), |entry|
@@ -247,17 +248,17 @@ CREATE TABLE chapters (
                     return Result::Ok(());
                 };
                 let ext = real_path.extension().and_then(OsStr::to_str);
-                if !entry.file_type().await?.is_file() || "epub" != ext.unwrap_or_default() {
+                if !entry.file_type().is_file() || "epub" != ext.unwrap_or_default() {
                     return Ok(());
                 }
                 let conn = ctx.pool.get().await?;
                 existing_files.write().await.insert(CompactString::from(path));
-                let metadata = entry.metadata().await?;
+                let metadata = tokio::fs::metadata(real_path).await?;
                 let row = conn.query_opt("SELECT timestamp FROM books WHERE id = $1", &[&hash_str(path)]).await?;
                 let timestamp: DateTime<Utc> = row.map(|r| r.get(0)).unwrap_or(DateTime::<Utc>::MIN_UTC);
                 let modtime = systemtime_to_utc(metadata.modified()?)?;
                 if modtime > timestamp {
-                    let relpath = entry.path().as_path().strip_prefix(&base_path)?.as_os_str().to_str().context("invalid path")?.to_compact_string();
+                    let relpath = entry.path().strip_prefix(&base_path)?.as_os_str().to_str().context("invalid path")?.to_compact_string();
                     handle_epub(relpath.clone(), ctx, entry, existing_files).await
                 } else {
                     Ok(())

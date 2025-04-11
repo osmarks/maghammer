@@ -1,12 +1,14 @@
-database = "host=localhost port=5432 user=maghammer dbname=maghammer"
+database = "host=localhost port=5432 user=maghammer dbname=maghammer-test"
 concurrency = 8
 
 [semantic]
 backend = "http://100.64.0.10:1706"
 embedding_dim = 1024
-tokenizer = "Snowflake/snowflake-arctic-embed-l"
-max_tokens = 128
-batch_size = 256
+tokenizer = "lightonai/modernbert-embed-large"
+max_tokens = 4096
+batch_size = 12
+document_prefix = "search_document: "
+query_prefix = "search_query: "
 
 [indexers.text_files]
 path = "/data/archive"

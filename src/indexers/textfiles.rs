@@ -7,9 +7,8 @@ use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::instrument;
-use crate::util::{hash_str, parse_html, parse_pdf, systemtime_to_utc, urlencode, CONFIG};
+use crate::util::{hash_str, parse_html, parse_pdf, systemtime_to_utc, urlencode, CONFIG, async_walkdir};
 use crate::indexer::{Ctx, Indexer, TableSpec, delete_nonexistent_files, ColumnSpec};
-use async_walkdir::WalkDir;
 use chrono::prelude::*;
 use regex::RegexSet;
 
@@ -85,7 +84,7 @@ CREATE TABLE text_files (
     }
 
     async fn run(&self, ctx: Arc<Ctx>) -> Result<()> {
-        let entries = WalkDir::new(&self.config.path); // TODO
+        let entries = async_walkdir(self.config.path.clone().into(), false, |_| true);
         let ignore = &self.ignore;
         let base_path = &self.config.path;
 
@@ -121,7 +120,7 @@ impl TextFilesIndexer {
     }
 
     #[instrument(skip(ctx, ignore, existing_files, base_path))]
-    async fn process_file(entry: async_walkdir::DirEntry, ctx: Arc<Ctx>, ignore: &RegexSet, existing_files: Arc<RwLock<HashSet<CompactString>>>, base_path: &String) -> Result<()> {
+    async fn process_file(entry: walkdir::DirEntry, ctx: Arc<Ctx>, ignore: &RegexSet, existing_files: Arc<RwLock<HashSet<CompactString>>>, base_path: &String) -> Result<()> {
         let real_path = entry.path();
         let path = if let Some(path) = real_path.strip_prefix(base_path)?.to_str() {
             path
@@ -129,17 +128,17 @@ impl TextFilesIndexer {
             return Result::Ok(());
         };
         let ext = real_path.extension().and_then(OsStr::to_str);
-        if ignore.is_match(path) || !entry.file_type().await?.is_file() || !VALID_EXTENSIONS.contains(ext.unwrap_or_default()) {
+        if ignore.is_match(path) || !entry.file_type().is_file() || !VALID_EXTENSIONS.contains(ext.unwrap_or_default()) {
             return Ok(());
         }
         let mut conn = ctx.pool.get().await?;
         existing_files.write().await.insert(CompactString::from(path));
-        let metadata = entry.metadata().await?;
+        let metadata = tokio::fs::metadata(real_path).await?;
         let row = conn.query_opt("SELECT timestamp FROM text_files WHERE id = $1", &[&hash_str(path)]).await?;
         let timestamp: DateTime<Utc> = row.map(|r| r.get(0)).unwrap_or(DateTime::<Utc>::MIN_UTC);
         let modtime = systemtime_to_utc(metadata.modified()?)?;
         if modtime > timestamp {
-            let parse = TextFilesIndexer::read_file(&real_path, ext).await;
+            let parse = TextFilesIndexer::read_file(&real_path.to_path_buf(), ext).await;
             match parse {
                 Ok(None) => (),
                 Ok(Some((content, title))) => {

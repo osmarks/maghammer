@@ -8,7 +8,7 @@ tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_j
 tokio = { version = "1", features = ["full", "tracing"]}
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
-async-walkdir = "2"
+walkdir = "2"
 lazy_static = "1"
 compact_str = { version = "0.8.0-beta", features = ["serde"] }
 seahash = "4"
@@ -17,7 +17,7 @@ serde = { version = "1", features = ["derive"] }
 reqwest = "0.12"
 deadpool-postgres = "0.14"
 pgvector = { version = "0.3", features = ["postgres", "halfvec"] }
-tokenizers = { version = "0.19", features = ["http"] }
+tokenizers = { version = "0.21", features = ["http"] }
 regex = "1"
 futures = "0.3"
 html5gum = "0.5"
